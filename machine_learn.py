@@ -229,21 +229,21 @@ def preprocess_data():
     print 'Read data...'
     for i in range(START_YEAR, END_YEAR + 1):
         current_year = i
-        ACLED[current_year] = read_csv('data/Conflict/{}.csv'.format(current_year))
+        ACLED[current_year] = read_csv('DATA/Conflict/{}.csv'.format(current_year))
 
-    diamonds = read_csv('data/diamonds.csv')
-    districts = read_csv('data/districts.csv')
-    ethnic_comp = read_csv('data/ethnic.comp.csv')
-    gdp_mean = read_csv('data/gdp.mean.csv')
-    gdp_mean_change = read_csv('data/gdp.mean.change.csv')
-    gdp_sum = read_csv('data/gdp.sum.csv')
-    hazard = read_csv('data/hazard.csv')
-    land = read_csv('data/land.csv')
-    petrol = read_csv('data/petrol.csv')
-    pop_mean = read_csv('data/pop.mean.csv')
-    pop_sum = read_csv('data/pop.sum.csv')
-    poverty = read_csv('data/u5-imr.csv')
-    dpi = read_csv('data/dpi.csv')
+    diamonds = read_csv('DATA/diamonds.csv')
+    districts = read_csv('DATA/districts.csv')
+    ethnic_comp = read_csv('DATA/ethnic.comp.csv')
+    gdp_mean = read_csv('DATA/gdp.mean.csv')
+    gdp_mean_change = read_csv('DATA/gdp.mean.change.csv')
+    gdp_sum = read_csv('DATA/gdp.sum.csv')
+    hazard = read_csv('DATA/hazard.csv')
+    land = read_csv('DATA/land.csv')
+    petrol = read_csv('DATA/petrol.csv')
+    pop_mean = read_csv('DATA/pop.mean.csv')
+    pop_sum = read_csv('DATA/pop.sum.csv')
+    poverty = read_csv('DATA/u5-imr.csv')
+    dpi = read_csv('DATA/dpi.csv')
 
     # Sort
 
