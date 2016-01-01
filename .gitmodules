@@ -1,0 +1,3 @@
+[submodule "ml-and-conflict-prevention"]
+	path = ml-and-conflict-prevention
+	url = https://github.com/ktalik/ml-and-conflict-prevention
