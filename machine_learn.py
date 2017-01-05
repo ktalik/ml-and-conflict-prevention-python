@@ -1,4 +1,5 @@
 #!/usr/bin/env python2
+# coding: utf-8
 
 '''
 Python rewrite and extension of *Machine Learning and Conflict Prevention*
@@ -23,12 +24,17 @@ along with this code.  If not, see <http://www.gnu.org/licenses/>.
 
 import numpy as np
 import pandas as pd
+import sklearn.cluster
+import sklearn.preprocessing
+import scipy as sp
 import time
 
 import matplotlib
 
 from pandas import read_csv
+from copy import deepcopy
 from matplotlib import pyplot as plt
+
 
 matplotlib.style.use('ggplot')
 
@@ -38,7 +44,9 @@ matplotlib.style.use('ggplot')
 ##
 
 COLUMNS_SORTED_ACC = [
+    # Number of battles in previous three years
     'battles.index',
+    # Land conflict index (risk?)
     'land.conf.norm',
     'pop.sum',
     'pop.mean.lag',
@@ -81,6 +89,7 @@ COLUMNS_FROM_PAPER = [
     'petrol',
     'u5pop.mean',
     'uw.perc.mean',
+    # Immature mortality rate percent mean
     'imr.perc.mean',
     'gdp.mean',
     'gdp.mean.lag',
@@ -117,10 +126,87 @@ COLUMNS_FROM_PAPER = [
     'oppo.share.3'
 ]
 
+# These are slices,
+# so two slices [a, b, c] mean 3 buckets (-inf, a), [a, b), [b, inf)
+REPRESENTATION_SLICES = {
+    'ID': [50000, 150000],
+    'land.conf.norm': [0.5],
+    'flood.freq.mean': [2.5, 5],
+    'drought.freq.mean': [5, 7.5],
+    'lootable.diamonds': [0.5],
+    'uw.perc.mean': [0.1, 0.4],
+    'imr.perc.mean': [0.1],
+    'gdp.mean': [50],
+    'gdp.mean.lag': [50],
+    'gdp.mean.lag.2': [50],
+    'gdp.mean.change': [0.1],
+    'gdp.mean.change.lag': [0.1],
+    'gdp.mean.change.lag.2': [0.1],
+    'gdp.mean.sum': [50],
+    'gdp.mean.sum.lag': [50],
+    'gdp.mean.sum.lag.2': [50],
+    'pop.mean': [5 * 10**4],
+    'pop.mean.lag': [5 * 10**4],
+    'pop.mean.lag.2': [5 * 10**4],
+    'pop.sum': [0.1 * 10**7],
+    'pop.sum.lag': [0.1 * 10**7],
+    'pop.sum.lag.2': [0.1 * 10**7],
+    'battles.index': [10**5, 2.5 * 10**5],
+    'military': [0.5],
+    'gov.share': [0.05],
+    'gov.share.1': [0.5],
+    'gov.share.2': [0.1, 0.3],
+    'gov.share.3': [0.05, 0.15],
+    'oppo.share': [0.05, 0.15],
+    'oppo.share.1': [0.1, 0.4],
+    'oppo.share.2': [0.05, 0.2],
+    'oppo.share.3': [0.05, 0.2],
+}
+
+NAMED_FEATURES = [
+    'ISO', 'poli.sys', 'exec.allign', 'exec.rel', 'leg.elective.rules',
+    'exec.elective.rules', 'muni.gov.elected', 'state.gov.elected'
+]
+
+# >>> sorted(list(set(df['ISO'])))
+COUNTRY_ISO = ['AGO', 'BDI', 'BEN', 'BFA', 'BWA', 'CAF', 'CIV', 'CMR', 'COD',
+'COG', 'DJI', 'DZA', 'EGY', 'ERI', 'ESH', 'ESP', 'ETH', 'GAB', 'GHA', 'GIN',
+'GMB', 'GNB', 'GNQ', 'ISR', 'JOR', 'KEN', 'LBR', 'LBY', 'LSO', 'MAR', 'MLI',
+'MOZ', 'MRT', 'MWI', 'NAM', 'NER', 'NGA', 'PSE', 'RWA', 'SDN', 'SEN', 'SLE',
+'SOM', 'SSD', 'SWZ', 'TCD', 'TGO', 'TUN', 'TZA', 'UGA', 'ZAF', 'ZMB', 'ZWE']
+
+COLUMNS_NEW_REPRESENTATION = REPRESENTATION_SLICES.keys() + ['YEAR']
+
+COLUMNS_WITH_GEO = COLUMNS_NEW_REPRESENTATION + ['lat_dec', 'lon_dec']
+
+###
+# Input data selection and preprocessing
+###
+
 #LEARNING_COLUMNS = COLUMNS_SORTED_ACC
 LEARNING_COLUMNS = COLUMNS_FROM_PAPER
+#LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+#LEARNING_COLUMNS = COLUMNS_WITH_GEO
+
+# Use REPRESENTATION_SLICES rules to create a new KDE-based data representation
+CHANGE_DATA_REPRESENTATION = False
+
+# NOTE: Below are active with CHANGE_DATA_REPRESENTATION
+# Remove base feature from which a new representation is derived
+REMOVE_BASE_FEATURE = False # True
+# Generate automatic slices
+AUTOMATIC_SLICES = False # True
+
+###
+# Input data parameters
+###
+
 LEARN_ON_EQUAL_POWER = True
-BATTLE_CLASS_POWER_MULTIPLIER = 1  # 5
+BATTLE_CLASS_POWER_MULTIPLIER = 1 # 5
+
+###
+# Input data constants
+###
 
 ALL_COL_1997 = 9
 
@@ -128,6 +214,10 @@ START_YEAR = 1997
 END_YEAR = 2012
 
 TARGET_COLUMN = 'dummy.battles'  # 'dummy.battles'
+
+###
+# Plot
+###
 
 PLOT_KDE = False
 PLOT_LEARNING = True
@@ -177,49 +267,119 @@ def plot_kde(data, colors=None, title=None, save=None):
         mng.window.showMaximized()
         plt.show()
 
+
 def init_learning_plot():
     """ Initialize plotting interactive mode """
     plt.ion()
 
-def update_learning_plot(train_acc, valid_acc, valid_0_acc, valid_1_acc):
+
+def update_learning_plot(iters, plot_history):
+    #train_acc, valid_acc, valid_0_acc, valid_1_acc, test_acc):
     """ Update plot that displays learning results """
+
     plt.clf()
-    if not train_acc or not valid_0_acc or not valid_1_acc:
-        return
-    valid_0_line, = plt.plot(
-        valid_0_acc,
-        'g',
-        label='Validation ACC of 0: {:.2f}%'.format(valid_0_acc[-1])
-    )
-    valid_1_line, = plt.plot(
-        valid_1_acc,
-        'r',
-        label='Validation ACC of 1: {:.2f}%'.format(valid_1_acc[-1])
-    )
-    learn_line, = plt.plot(
-        train_acc,
-        'b',
-        label='Learning ACC: {:.2f}%'.format(train_acc[-1])
-    )
-    valid_line, = plt.plot(
-        valid_acc,
-        'k',
-        label='Validation ACC: {:.2f}%'.format(valid_acc[-1])
-    )
+    legend_handles = []
+
+    # Colors are for metrics
+    colors = {
+        'accuracy_score' : 'green',
+        'matthews_corrcoef' : 'blue',
+        'roc_auc_score' : 'red',
+        'f1_score' : 'gold',
+        'mse' : 'green',
+        'r2_score' : 'red',
+        '0 validation' : 'blue',
+        '1 validation' : 'red',
+        '0 test' : 'blue',
+        '1 test' : 'red',
+    }
+
+    # Line styles are for datasets
+    styles = {
+        'training' : ':',
+        'validation' : '--',
+        '0 validation' : '--',
+        '1 validation' : '--',
+        '0 test' : '-',
+        '1 test' : '-',
+        'test' : '-',
+    }
+
+    # Name shortcut
+    names = {
+        'accuracy_score' : 'ACC',
+        'matthews_corrcoef' : 'MCC',
+        'roc_auc_score' : 'AUC',
+        'f1_score' : 'F1',
+        'mse': 'MSE',
+        'r2_score': 'R2 Score',
+    }
+
+    fig = plt.figure(1)
+    ax = fig.add_subplot(111)
+
+    for metric in plot_history:
+        for plot_set in plot_history[metric]:
+
+            color = colors.get(plot_set, colors.get(metric, None))
+            style = styles.get(plot_set, None)
+            history = plot_history[metric][plot_set]
+            name = names.get(metric, metric)
+
+            if not history:
+                continue
+
+            print 'hist', history
+
+            if len(history) < 2:
+                continue
+
+            label = None
+
+            if not (metric[:7] == 'hid1_w_' \
+                and history[-1] > -5 and history[-1] < 5):
+                # Ommit low weight values for picture readability
+
+                    label = '{} {}: {:.2f}%'.format(
+                        plot_set[0].upper() + plot_set[1:],
+                        name,
+                        history[-1]
+                    )
+
+                    legend_line, = plt.plot(
+                        iters,
+                        history,
+                        color=color,
+                        linestyle=style,
+                        label=label,
+                    )
+
+                    legend_handles.append(legend_line)
+
+                    ann_xy = (iters[-1], history[-1])
+                    ax.annotate(
+                        '{}: {:.2f}%'.format(name, history[-1]),
+                        xy=ann_xy, xytext=ann_xy, size='xx-small')
+
     plt.legend(
         loc='lower left',
-        handles=[learn_line, valid_line, valid_0_line, valid_1_line])
+        handles=legend_handles,
+        framealpha=0.5
+    )
     plt.show()
     plt.pause(0.001)
 
+
 def save_learning_plot(filename='current_learning.png'):
+    figure = plt.gcf()
+    figure.set_size_inches(17.07, 8.22)
     plt.savefig(PLOT_SAVE_DIR + filename)
 
 ##
-# Preprocessing
+# Load raw data
 ##
 
-def preprocess_data():
+def raw_data():
     """ Load all available input data and return them as single DataFrame """
 
     ACLED = dict()
@@ -418,30 +578,86 @@ def preprocess_data():
     df['ID'] = dpi['ID']
     df['YEAR'] = dpi['YEAR']
     data_full = pd.merge(data_full, df, on=['ID', 'YEAR'])
+    data_full.drop_duplicates(inplace=True)
 
     # Final typecast
     print 'Final typecast...'
     data_full.fillna(0, inplace=True)
-    for c in [
-        'ISO', 'poli.sys', 'exec.allign', 'exec.rel', 'leg.elective.rules',
-        'exec.elective.rules', 'muni.gov.elected', 'state.gov.elected'
-        ]:
-            # FIXME: Better representation
-            data_full[c] = map(hash, data_full[c])
-            data_full[c] = data_full[c].astype(np.float32)
-    data_full.astype(np.float32)
+
+    for c in NAMED_FEATURES:
+            # Eliminate duplicate zeros...
+            data_full[c].replace(to_replace='0', value=0, inplace=True)
 
     return data_full
 
-def prepare_for_learning(data_full):
+
+def data_expanded():
+    '''
+    Expand base data with new features
+    '''
+    df = raw_data()
+
+    if 'lat_dec' in LEARNING_COLUMNS or 'lon_dec' in LEARNING_COLUMNS:
+        from data import scrap_wikipedia_cities as wiki_countries
+
+        alpha3_name = wiki_countries.alpha3_name
+        countries = wiki_countries.countries_df
+
+        df['country'] = [alpha3_name[iso] for iso in df['ISO']]
+
+        if 'lat_dec' in LEARNING_COLUMNS:
+            df['lat_dec'] = [
+                countries[country]['latitude_dec'] for country in df['country']]
+        if 'lon_dec' in LEARNING_COLUMNS:
+            df['lon_dec'] = [
+                countries[country]['longitude_dec'] for country in df['country']]
+
+        df.pop('country')
+
+    # FIXME: Remove NaNs?
+    df.fillna(0, inplace=True)
+
+    return df
+
+
+def data_numeric():
+    data_full = data_expanded()
+
+    for c in NAMED_FEATURES:
+        c_values = list(set(data_full[c]))
+        data_full[c] = [c_values.index(x) for x in data_full[c]]
+
+        if AUTOMATIC_SLICES:
+            global REPRESENTATION_SLICES
+            REPRESENTATION_SLICES[c] = range(len(set(data_full[c])))
+
+    return data_full
+
+
+##
+# Preprocessing
+##
+
+
+def preprocess_data():
+    data_full = data_numeric()
+    data_full.astype(np.float32)
+    c = data_full.columns
+    assert(len(list(c)) == len(set(c)))
+
+    return data_full
+
+
+def data_encoded():
     """
     Prepare datasets for classification learning
 
+    Most importantly, additional data columns are introduced in order to
+    provide a new data representation for better learning results.
     Method shuffles input data, normalizes its values and classes power.
-    Returns tuple `(X_learn, y_learn, X_test, y_test)`.
-    Learning dataset includes data from 1997 to 2011.
-    Test dataset includes 2012 data.
     """
+    data_full = preprocess_data()
+
     print 'Shuffle data...'
     np.random.seed(2016)
     data_full = data_full.reindex(np.random.permutation(data_full.index))
@@ -453,13 +669,64 @@ def prepare_for_learning(data_full):
             title='RAW data'
         )
 
+    data_prepared = data_full[LEARNING_COLUMNS]
+
+    if CHANGE_DATA_REPRESENTATION:
+        print 'Change data representation...'
+
+        # Generate binary representations
+        for feature in REPRESENTATION_SLICES:
+            # Process only selected columns
+            if not feature in LEARNING_COLUMNS:
+                continue
+
+            slices = REPRESENTATION_SLICES[feature]
+            for i, value in enumerate(slices):
+                if len(slices) > 1 and i > 0:
+                    data_prepared[feature + '.f' + str(i)] = \
+                        (data_prepared[feature] >= slices[i-1]) \
+                      & (data_prepared[feature] < value)
+                else:
+                    data_prepared[feature + '.f' + str(i)] = \
+                        data_prepared[feature] < value
+            data_prepared[feature + '.f' + str(len(slices))] = \
+                data_prepared[feature] >= slices[len(slices)-1]
+
+            if REMOVE_BASE_FEATURE:
+                data_prepared.pop(feature)
+
+            c = data_prepared.columns
+            assert(len(list(c)) == len(set(c)))
+
+    if PLOT_KDE:
+        print 'Plot KDE for data...'
+        for c in data_prepared.columns:
+            plot_kde(
+               data=data_prepared[c][:4000],
+               title=c,
+               save=PLOT_SAVE_DIR + 'kde/' + c + '.png'
+            )
+        exit(0)
+
+    c = data_prepared.columns
+    assert(len(list(c)) == len(set(c)))
+
+    return data_full, data_prepared
+
+
+def prepare_for_learning(data_full, data_prepared):
+    '''
+    data_full - raw data DataFrame
+    data_prepared - data_encoded() DataFrame
+    Returns tuple `(X_learn, y_learn, X_test, y_test)`.
+    Learning dataset includes data from 1997 to 2011.
+    Test dataset includes 2012 data.
+    '''
     # Trim to relevant feature space and split 2012 off for final testing
     print 'Trim and split...'
 
-    data_trimmed = data_full[LEARNING_COLUMNS]
-
     X_learn = np.array(
-        data_trimmed[
+        data_prepared[
             data_full['YEAR'] != 2012
         ])
     y_learn = np.array(
@@ -471,10 +738,10 @@ def prepare_for_learning(data_full):
     y_learn = y_learn.astype(np.int32)
 
     X_test = np.array(
-        data_trimmed[
+        data_prepared[
             data_full['YEAR'] == 2012
         ])
-    del data_trimmed
+    del data_prepared
     y_test = np.array(
         data_full[
             data_full['YEAR'] == 2012
@@ -528,17 +795,20 @@ def prepare_for_learning(data_full):
 
     print 'Normalize...'
 
-    X_max = np.max([
-        np.max(np.abs(X_learn), axis=0),
-        np.max(np.abs(X_test), axis=0)
-    ]) * 2
-    y_max = np.max([
-        np.max(np.abs(y_learn), axis=0),
-        np.max(np.abs(y_test), axis=0)
-    ]) * 2
+    # Normalize to interval
+    norm_a, norm_b = 0.1, 0.9
 
-    X_learn /= X_max
-    X_test /= X_max
+    X_min = np.min([
+        np.min(X_learn, axis=0),
+        np.min(X_test, axis=0)
+    ])
+    X_max = np.max([
+        np.max(X_learn, axis=0),
+        np.max(X_test, axis=0)
+    ])
+
+    X_learn = (((norm_b - norm_a) * (X_learn - X_min)) / (X_max - X_min)) + norm_a
+    X_test = (((norm_b - norm_a) * (X_test - X_min)) / (X_max - X_min)) + norm_a
 
     print 'Data normalized so that:'
     print '* X_learn has:'
@@ -546,30 +816,24 @@ def prepare_for_learning(data_full):
     print '* X_test has:'
     print 'min:', X_test.min(), 'max:', X_test.max()
 
-
-    if PLOT_KDE:
-        print 'Plot KDE for normalized learning data...'
-        for c in range(X_learn.shape[1]):
-            plot_kde(
-               data=pd.DataFrame(X_learn[:, c], columns=[LEARNING_COLUMNS[c]]),
-               title=str(LEARNING_COLUMNS[c]),
-               save=PLOT_SAVE_DIR + 'kde/' + str(LEARNING_COLUMNS[c]) + '.png'
-            )
-
     return X_learn, y_learn, X_test, y_test
 
 
 def experiment(
     X_learn, y_learn, X_test, y_test,
-    algo='rmsprop',
-    learning_rate=0.0001,
-    momentum=0,
-    neurons=10**2,
-    patience=100*1000,
-    # Sparse hidden activations
-    # have shown much promise in computational neural networks.
-    hidden_l1 = 0.01,
-    weight_l2 = 0.0001,
+    neurons,
+    theanets_kwargs,
+    column_names=None,
+    name='my_exp',
+    max_iters=float('inf'),
+    gather_metrics=[
+        'accuracy_score',
+        'matthews_corrcoef',
+        'roc_auc_score',
+        'f1_score',
+        ],
+    plot_every=50,
+    regression=False,
     ):
 
     import climate
@@ -591,9 +855,20 @@ def experiment(
     datasets = {
         'training':     (X_train, y_train),
         'validation':   (X_valid, y_valid),
+        '0 validation': (X_valid[y_valid == 0], y_valid[y_valid == 0]),
+        '1 validation': (X_valid[y_valid == 1], y_valid[y_valid == 1]),
+        '0 test':       (X_test[y_test == 0], y_test[y_test == 0]),
+        '1 test':       (X_test[y_test == 1], y_test[y_test == 1]),
+        'test':         (X_test, y_test)
     }
 
-    layers=(X_learn.shape[1], (neurons, 'relu'), 2)
+    for key in datasets.keys():
+        datasets[key] = (datasets[key][0], datasets[key][1])
+
+    layers=(X_learn.shape[1],) + neurons + (2,)
+
+    if regression:
+        layers=(X_learn.shape[1],) + neurons + (1,)
 
     import theanets
 
@@ -602,70 +877,762 @@ def experiment(
         layers=layers,
     )
 
-    train_acc_history = []
-    valid_acc_history = []
-    valid_0_acc_history = []
-    valid_1_acc_history = []
+    if regression:
+        exp = theanets.Experiment(
+            theanets.Regressor,
+            layers=layers
+        )
 
-    init_learning_plot()
-
-    from sklearn.metrics import accuracy_score
+    network = exp.network
 
     print 'Start learning...'
 
     iteration = 0
 
+    # Metrics that we want to measure while observing results
+    metrics = []
+    # ACC
+    if 'accuracy_score' in gather_metrics:
+        metrics.append({
+            'name': 'accuracy_score',
+            'function': sklearn.metrics.accuracy_score
+        })
+    # MCC
+    if 'matthews_corrcoef' in gather_metrics:
+        metrics.append({
+            'name': 'matthews_corrcoef',
+            'function': sklearn.metrics.matthews_corrcoef
+        })
+    # AUC
+    if 'roc_auc_score' in gather_metrics:
+        metrics.append({
+            'name': 'roc_auc_score',
+            'function': sklearn.metrics.roc_auc_score
+        })
+    # F1
+    if 'f1_score' in gather_metrics:
+        metrics.append({
+            'name': 'f1_score',
+            'function': sklearn.metrics.f1_score
+        })
+
+    # Regression
+
+    # MSE
+    if 'mse' in gather_metrics:
+        metrics.append({
+            'name': 'mse',
+            'function': sklearn.metrics.mean_squared_error
+        })
+
+    if 'r2_score' in gather_metrics:
+        metrics.append({
+            'name': 'r2_score',
+            'function': sklearn.metrics.r2_score
+        })
+
+    if column_names is not None:
+        for w_i in xrange(X_learn.shape[1]):
+            metrics.append({
+                'name': 'hid1_w_' + column_names[w_i],
+                'inspect': ('hid1', 'w', w_i)
+            })
+
+    # Sets that we want to test
+    plot_sets = [
+        'training',
+        'validation',
+        '0 test',
+        '1 test',
+        'test'
+    ]
+
+    init_learning_plot()
+
+    # Init histories
+    plot_history = dict()
+    for metric in metrics:
+        plot_history[metric['name']] = dict()
+        for plot_set in plot_sets:
+            if metric['name'] == 'roc_auc_score' \
+                    and plot_set[0] == '0':
+                continue
+            if metric['name'] == 'roc_auc_score' \
+                    and plot_set[0] == '1':
+                continue
+            if metric['name'] == 'f1_score' \
+                    and plot_set[0] == '0':
+                continue
+            if metric['name'] == 'f1_score' \
+                    and plot_set[0] == '1':
+                continue
+            if metric['name'] == 'matthews_corrcoef' \
+                    and plot_set[0] == '0':
+                continue
+            if metric['name'] == 'matthews_corrcoef' \
+                    and plot_set[0] == '1':
+                continue
+            plot_history[metric['name']][plot_set] = []
+    iters = []
+
+    # Automatic metrics from theanets
+    #plot_history['error'] = dict()
+    #plot_history['error']['validation'] = []
+    #plot_history['loss'] = dict()
+    #plot_history['loss']['validation'] = []
+
+    # XXX
+    #plot_history['accuracy_score']['training'] = []
+
+    print 'Collecting following metrics:'
+    print gather_metrics
+
     for tm, vm in exp.itertrain(
             datasets['training'],
             datasets['validation'],
-            algo=algo,
-            learning_rate=learning_rate,
-            momentum=momentum,
-            hidden_l1=hidden_l1,
-            weight_l2=weight_l2,
-            patience=patience,
+            **theanets_kwargs
             ):
         iteration += 1
 
-        # Validate every class separately
-        y_pred_0 = exp.network.classify(X_valid[y_valid == 0])
-        y_pred_1 = exp.network.classify(X_valid[y_valid == 1])
-        valid_0_acc_history.append(
-            accuracy_score(y_valid[y_valid == 0], y_pred_0) * 100)
-        valid_1_acc_history.append(
-            accuracy_score(y_valid[y_valid == 1], y_pred_1) * 100)
+        if iteration > max_iters:
+            break
 
-        train_acc_history.append(tm['acc'] * 100)
-        valid_acc_history.append(vm['acc'] * 100)
+        if iteration % plot_every:
+            continue
 
-        # FIXME: First validation ACC is 1.0
-        update_learning_plot(
-            train_acc_history[10:],
-            valid_acc_history[10:],
-            valid_0_acc_history[10:],
-            valid_1_acc_history[10:])
+        for metric in metrics:
 
-        if iteration == 490:
-            save_learning_plot()
+            if not metric['name'] in gather_metrics:
+                continue
+
+            for plot_set in plot_sets:
+
+                X_set, y_set = datasets[plot_set]
+
+                if metric['name'] == 'roc_auc_score' \
+                        and plot_set[0] == '0':
+                    continue
+                if metric['name'] == 'roc_auc_score' \
+                        and plot_set[0] == '1':
+                    continue
+                if metric['name'] == 'f1_score' \
+                        and plot_set[0] == '0':
+                    continue
+                if metric['name'] == 'f1_score' \
+                        and plot_set[0] == '1':
+                    continue
+                if metric['name'] == 'matthews_corrcoef' \
+                        and plot_set[0] == '0':
+                    continue
+                if metric['name'] == 'matthews_corrcoef' \
+                        and plot_set[0] == '1':
+                    continue
+
+                if metric['name'] == 'accuracy_score' \
+                        and plot_set == 'validation':
+
+                    # Get it directly from theanets
+                    plot_history[metric['name']][plot_set].append(
+                        vm['acc'] * 100)
+
+                    continue
+
+                if metric['name'] == 'accuracy_score' \
+                        and plot_set == 'training':
+
+                    # Get it directly from theanets
+                    plot_history[metric['name']]['training'].append(
+                        tm['acc'] * 100)
+
+                    continue
+
+                if not regression:
+                    y_pred = exp.network.classify(X_set)
+                else:
+                    y_pred = exp.network.predict(X_set)
+
+                if 'function' in metric:
+                    scaling = 100.
+                    mini = 0.
+                    if metric['name'] == 'mse' \
+                            or metric['name'] == 'r2_score':
+                        scaling = 1.
+                        mini = float('-inf')
+                    plot_history[metric['name']][plot_set].append(
+                        max(
+                            mini,
+                            metric['function'](y_set, y_pred) * scaling)
+                    )
+
+            if 'inspect' in metric:
+                layer, param_name, param_x = metric['inspect']
+                param = network.find(layer, param_name)
+                values = param.get_value()
+                mean_value = np.mean(values[param_x]) * 100.
+                plot_history[metric['name']][plot_set].append(mean_value)
+
+        iters.append(iteration)
+
+        print 'iteration', iteration, {
+            m + '_' + s: plot_history[m][s][-1:] for m in plot_history
+            for s in plot_history[m]
+        }
+        update_learning_plot(iters, plot_history)
+
+        if iteration in [500, 1000, 2000, 5000]:
+            save_learning_plot(
+                'current_learning_' + str(iteration)
+                + '_' + name
+                + '.png'
+            )
 
     save_learning_plot('current_learning_end.png')
 
     from sklearn.metrics import classification_report, confusion_matrix
 
-    y_pred = exp.network.classify(X_test)
+    if not regression:
+        y_pred = exp.network.classify(X_test)
+    else:
+        y_pred = exp.network.predict(X_test)
 
-    print 'classification_report:\n', classification_report(y_test, y_pred)
-    print 'confusion_matrix:\n', confusion_matrix(y_test, y_pred)
+
+    if not regression:
+        print 'classification_report:\n', \
+            classification_report(y_test, y_pred)
+        print 'confusion_matrix:\n', \
+            confusion_matrix(y_test, y_pred)
+
+    for metric in metrics:
+        plot_history[metric['name']]['test_max'] = max(
+            plot_history[metric['name']]['test'])
+
+    return plot_history
 
 
-if __name__ == '__main__':
-    data_full = preprocess_data()
-    X_learn, y_learn, X_test, y_test = prepare_for_learning(data_full)
+def exp_mlcp1_basic_t1_100():
+    """MLCP1-Basic with T1-100
+
+    Basic dataset from MLCP with one layer 100 hidden neurons architecture.
+
+    There was no representation change introduced in this dataset.
+    The normalization operation was the only operation performed.
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_FROM_PAPER
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
     kwargs = {
         'X_learn': X_learn,
         'y_learn': y_learn,
         'X_test': X_test,
         'y_test': y_test,
+        'neurons': ((100, 'relu'),),
+        'max_iters': 50000,
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
     }
     experiment(**kwargs)
 
+
+def exp_mlcp2_limited_t1_100():
+    """MLCP2-Limited with T1-100
+
+    MLCP dataset limited to 20 features with higher importance,
+    based on variable importance measurement of random forest metric used in MLCP.
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_SORTED_ACC
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T1-100
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((100, 'relu'),),
+        'max_iters': 50000,
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_mlcp3_extended_t1_100():
+    """MLCP3-Extended with T1-100
+
+    Extended representation of MLCP2-Limited, where a KDE
+    based one-hot encodings were used instead of base dimensions. This way, base
+    features were replaced with two or three bit encodings, resulting in 45 features.
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = True
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T1-100
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((100, 'relu'),),
+        'max_iters': 50000,
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_mlcp4_combined_t1_100():
+    """MLCP4-Combined with T1-100
+
+    MLCP1-Basic and MLCP3-Extended combined together,
+    resulting in 87 features.
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = False
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T1-100
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((100, 'relu'),),
+        'max_iters': 50000,
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_regularizers_grid_search():
+    """Regularizers grid search"""
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    regularizers = [
+        {'hidden_l1': 0.1}, {'weight_l1': 0.0001}, {'weight_l2': 0.0001},
+        {'input_noise': 0.1}, {'hidden_noise': 0.1},
+        {'input_dropout': 0.3}, {'hidden_dropout': 0.3}]
+
+    test_no = 0
+
+    metric_history = list()
+
+    for reg in regularizers:
+        for algo in ['rmsprop', 'rprop', 'sgd', 'adam']:
+
+            test_no += 1
+
+            theanets_kwargs = dict(
+                algo='rmsprop',
+                learning_rate=0.0001,
+                momentum=0,
+                patience=100*1000,
+            )
+
+            theanets_kwargs.update(reg)
+
+            kwargs = {
+                'X_learn': X_learn,
+                'y_learn': y_learn,
+                'X_test': X_test,
+                'y_test': y_test,
+                'neurons': ((10, 'relu'),),
+                'name': str(test_no).zfill(2) + '_' + algo + '_' + reg.keys()[0],
+                'max_iters': 1000,
+                'theanets_kwargs': theanets_kwargs
+            }
+
+            metric_history.append(((reg, algo), experiment(**kwargs)))
+
+    print metric_history
+
+
+def exp_mlcp3_extended_t2_10():
+    """MLCP3-Extended with T2-10
+
+    T2-10 Selected as a result of grid search on different regularization
+    methods and optimizer algorithms for hidden layer of 10 neurons. 
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = True
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T2-10
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((10, 'relu'),),
+        'name': '03_5x5_l1l2_',
+        'max_iters': 50000,
+        'gather_metrics': [
+            'accuracy_score',
+            #'matthews_corrcoef',
+            #'roc_auc_score',
+            #'f1_score',
+            ],
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_dropout=0.3,
+            #hidden_l1 = 0.01,
+            #weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_mlcp4_combined_t3_10():
+    """MLCP4-Combined with T3-10"""
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = False
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T3-10
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((10, 'relu'),),
+        'name': '03_5x5_l1l2_',
+        'max_iters': 50000,
+        'gather_metrics': [
+            'accuracy_score',
+            #'matthews_corrcoef',
+            #'roc_auc_score',
+            #'f1_score',
+            ],
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            #hidden_dropout=0.3,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_mlcp5_countries_t4_10_10():
+    """MLCP5-Countries with T4-10-10
+    
+    MLCP4-Combined expanded with one-hot encoding features
+    for every separate country, resulting in 100 features.
+
+    T4-10-10 - Deeper architecture with two layers
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = False
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T4-10-10
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((10, 'relu'), (10, 'relu'),),
+        'name': label,
+        'max_iters': 1000,
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_dropout=0.3,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_mlcp6_autoslices_t4_10_10():
+    """MLCP6-Autoslices with T4-10-10
+
+    MLCP6-Autoslices is MLCP5-Countries expanded with data of named (or text)
+    values. Features were replaced with one-hot encoding representation
+    of every possible value.
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = False
+
+    global AUTOMATIC_SLICES
+    AUTOMATIC_SLICES = True
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T4-10-10
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((10, 'relu'),(10, 'relu')),
+        'name': 'slices',
+        'max_iters': 1100,
+        'gather_metrics': [
+            'accuracy_score',
+            #'matthews_corrcoef',
+            #'roc_auc_score',
+            #'f1_score',
+            ],
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_dropout=0.3,
+            #input_noise=0.1,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_mlcp6_autoslices_t5_100():
+    """MLCP6-Autoslices with T5-100"""
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = False
+
+    global AUTOMATIC_SLICES
+    AUTOMATIC_SLICES = True
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    # T5-100
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'neurons': ((100, 'relu')),
+        'name': 'mlcp6_autoslices_t5_100',
+        'max_iters': 5000,
+        'gather_metrics': [
+            'accuracy_score',
+            #'matthews_corrcoef',
+            #'roc_auc_score',
+            #'f1_score',
+            ],
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_dropout=0.3,
+            #input_noise=0.1,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        )
+    }
+    experiment(**kwargs)
+
+
+def exp_mlcp7_geo_t5_100():
+    """MLCP7-Geo with T5-100
+    
+    MLCP7-Geo is MLCP6-Autoslices extended with latitude and longitude data of
+    corresponding countries.
+
+    This experiment compares results on data with and without geo columns.
+    """
+    global LEARNING_COLUMNS
+    LEARNING_COLUMNS = COLUMNS_NEW_REPRESENTATION
+
+    global CHANGE_DATA_REPRESENTATION
+    CHANGE_DATA_REPRESENTATION = True
+
+    global REMOVE_BASE_FEATURE
+    REMOVE_BASE_FEATURE = False
+
+    global AUTOMATIC_SLICES
+    AUTOMATIC_SLICES = True
+
+    learning_columns = deepcopy(LEARNING_COLUMNS)
+
+    for add_geo, label in [
+        (True, 'with_geo'),
+        (False, 'without_geo'),
+    ]:
+        if add_geo:
+            LEARNING_COLUMNS = learning_columns + ['lat_dec', 'lon_dec']
+        else:
+            LEARNING_COLUMNS = learning_columns
+
+        data_full, data_prepared = data_encoded()
+        X_learn, y_learn, X_test, y_test = prepare_for_learning(
+            data_full, data_prepared)
+
+        # T5-100
+        kwargs = {
+            'X_learn': X_learn,
+            'y_learn': y_learn,
+            'X_test': X_test,
+            'y_test': y_test,
+            'neurons': ((100, 'relu'),),
+            'name': label,
+            'max_iters': 5000,
+            'gather_metrics': [
+                'accuracy_score',
+                #'matthews_corrcoef',
+                #'roc_auc_score',
+                #'f1_score',
+                ],
+            'theanets_kwargs': dict(
+                algo='rmsprop',
+                learning_rate=0.0001,
+                momentum=0,
+                patience=100*1000,
+                hidden_dropout=0.3,
+                #input_noise=0.1,
+                hidden_l1 = 0.01,
+                weight_l2 = 0.0001,
+            )
+        }
+        experiment(**kwargs)
+
+
+def exp_feature_weights():
+    """Feature weights analysis"""
+
+    data_full, data_prepared = data_encoded()
+    X_learn, y_learn, X_test, y_test = prepare_for_learning(
+        data_full, data_prepared)
+
+    kwargs = {
+        'X_learn': X_learn,
+        'y_learn': y_learn,
+        'X_test': X_test,
+        'y_test': y_test,
+        'column_names': data_prepared.columns,
+        'neurons': ((10, 'relu'),),
+        'name': 'feature_weights',
+        #'max_iters': 5000,
+        'theanets_kwargs': dict(
+            algo='rmsprop',
+            learning_rate=0.0001,
+            momentum=0,
+            patience=100*1000,
+            hidden_dropout=0.3,
+            #input_noise=0.1,
+            hidden_l1 = 0.01,
+            weight_l2 = 0.0001,
+        ),
+        'gather_metrics': [
+            'accuracy_score',
+            'matthews_corrcoef',
+        ] + [
+            'hid1_w_' + data_prepared.columns[i]
+            for i in xrange(len(data_prepared.columns))
+        ],
+        'plot_every': 200,
+    }
+    experiment(**kwargs)
+
+
+if __name__ == '__main__':
+    exp_mlcp6_autoslices_t4_10_10()
